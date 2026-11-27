@@ -26,6 +26,20 @@
 
 ### Install X-UI-PRO
 
+The current installer is `x-ui-latest.sh`. On a VPS that already has the dependencies and its own firewall and kernel settings:
+
+```bash
+curl -fsSLo x-ui-latest.sh https://raw.githubusercontent.com/Skulift/x-ui-pro/master/x-ui-latest.sh
+sudo bash x-ui-latest.sh -subdomain panel.example.org \
+  -reality_domain reality.example.org --skip-ufw --skip-sysctl
+```
+
+Add `-install yes` if the dependencies still need to be installed. With `--skip-ufw`, open the required ports in your firewall ahead of time. HTTPS uses TCP 443, Let's Encrypt HTTP-01 uses TCP 80, and Hysteria 2 uses UDP 443 by default. `--skip-sysctl` leaves the kernel settings in place.
+
+If Certbot reports a temporary issuance error, the installer restores the previous Nginx HTTP challenge configuration. Retry after resolving the error or after the time specified by the certificate authority.
+
+For the legacy installer:
+
 ```
 bash <(wget -qO- https://github.com/mozaroc/x-ui-pro/raw/master/x-ui-pro.sh) -install yes -panel 1 -ONLY_CF_IP_ALLOW no
 ```

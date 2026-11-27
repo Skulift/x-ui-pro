@@ -19,6 +19,8 @@ hy2_cert=
 hy2_key=
 hy2_panel_url=
 backup_only=no
+skip_ufw=no
+skip_sysctl=no
 argument_count=$#
 ##################################generate ports and paths#############################################################
 get_port() {
@@ -54,15 +56,18 @@ while [ "$#" -gt 0 ]; do
     --add-hy2) hy2_mode=add; shift; continue;;
     --no-hy2) hy2_enabled=no; shift; continue;;
     --enable-db-backups) backup_only=yes; shift; continue;;
+    --skip-ufw) skip_ufw=yes; shift; continue;;
+    --skip-sysctl) skip_sysctl=yes; shift; continue;;
     --help|-h)
       cat <<'USAGE'
 Fresh installation (Debian/Ubuntu, systemd):
   sudo bash x-ui-latest.sh -install yes [-subdomain HOST -reality_domain HOST]
     [--hy2-port PORT] [--hy2-domain HOST --hy2-cert FULLCHAIN --hy2-key PRIVATE_KEY]
-    [--no-hy2]
+    [--no-hy2] [--skip-ufw] [--skip-sysctl]
 Add Hy2 to an existing 3x-ui installation:
   sudo bash x-ui-latest.sh --add-hy2 --panel-url https://HOST/PANEL_PATH/
     --hy2-domain HOST [--hy2-port PORT] [--hy2-cert FULLCHAIN --hy2-key PRIVATE_KEY]
+    [--skip-ufw]
 Enable daily database backups on an existing installation:
   sudo bash x-ui-latest.sh --enable-db-backups
 USAGE
@@ -295,7 +300,7 @@ add_hy2() (
     [[ $listening == *xray* ]] ||
         fail "Hy2 was created, but Xray did not open UDP $hy2_port. Check journalctl -u x-ui."
 
-    if [[ $hy2_mode == add ]] && command -v ufw >/dev/null &&
+    if [[ $hy2_mode == add && $skip_ufw == no ]] && command -v ufw >/dev/null &&
         LANG=C ufw status | grep -q '^Status: active'; then
         ufw allow "$hy2_port/udp" >&2 || fail "Could not update UFW for Hy2."
     fi
@@ -385,6 +390,26 @@ if [[ $hy2_enabled == yes ]]; then
     valid_domain "$hy2_domain" || fail "Enter a valid Hy2 hostname."
 fi
 ###############################Install Packages#########################################################
+check_nginx_https_config() {
+    local listeners config
+    listeners=$(ss -H -ltnp 'sport = :443') || fail "Could not inspect TCP 443."
+    [[ $listeners == *'"nginx"'* ]] || return 0
+    config=$(nginx -T) || fail "Could not read the Nginx configuration."
+    awk '
+        { sub(/#.*/, ""); gsub(/;/, " ") }
+        $1 == "listen" && $2 ~ /(^|:)443$/ {
+            udp = 0
+            for (i = 3; i <= NF; i++) if ($i == "udp") udp = 1
+            if (!udp) found = 1
+        }
+        END { exit !found }
+    ' <<<"$config" ||
+        fail "Nginx is serving TCP 443, but the configuration on disk has no TCP 443 listener. Restore the active configuration before retrying."
+}
+
+if command -v nginx >/dev/null && command -v ss >/dev/null; then
+    check_nginx_https_config
+fi
 if [[ ${INSTALL} == *"y"* ]]; then
 
          version=$(grep -oP '(?<=VERSION_ID=")[0-9]+' /etc/os-release)
@@ -396,11 +421,14 @@ if [[ ${INSTALL} == *"y"* ]]; then
 
 	$Pak -y update
 
-	$Pak -y install curl wget jq bash sudo nginx-full certbot python3-certbot-nginx sqlite3 ufw iproute2 openssl || fail "Package installation failed."
+	packages=(curl wget jq bash sudo nginx-full certbot python3-certbot-nginx sqlite3 iproute2 openssl ca-certificates)
+	[[ $skip_ufw == yes ]] || packages+=(ufw)
+	$Pak -y install "${packages[@]}" || fail "Package installation failed."
 
 	systemctl daemon-reload && systemctl enable --now nginx
 fi
 command -v ss >/dev/null || fail "Missing iproute2. Re-run with -install yes."
+[[ -s /etc/ssl/certs/ca-certificates.crt ]] || fail "Install the ca-certificates package before continuing."
 [[ $hy2_enabled == no ]] || check_udp_port
 ##################################GET SERVER IPv4-6#####################################################
 IP4_REGEX="^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$"
@@ -431,8 +459,6 @@ if [[ ${AUTODOMAIN} == *"y"* ]]; then
 fi
 
 
-install -d -m 0755 /var/lib/letsencrypt/.well-known/acme-challenge
-install -d -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled
 certbot_hosts=("$domain" "$reality_domain")
 if [[ $hy2_enabled == yes && -z $hy2_cert && -z $hy2_key &&
       $hy2_domain != "$domain" && $hy2_domain != "$reality_domain" ]]; then
@@ -440,7 +466,50 @@ if [[ $hy2_enabled == yes && -z $hy2_cert && -z $hy2_key &&
 fi
 [[ -z $hy2_cert && -z $hy2_key || -n $hy2_cert && -n $hy2_key ]] ||
     fail "Provide both --hy2-cert and --hy2-key."
-cat > /etc/nginx/sites-available/80.conf <<EOF
+
+issue_certificates() (
+    local available=/etc/nginx/sites-available/80.conf enabled=/etc/nginx/sites-enabled/80.conf
+    local backup host changed=no nginx_action= keep_config=no
+
+    check_nginx_https_config
+    nginx -t || fail "Fix the existing Nginx configuration before requesting certificates."
+    install -d -m 0755 /var/lib/letsencrypt/.well-known/acme-challenge \
+        /etc/nginx/sites-available /etc/nginx/sites-enabled || fail "Could not prepare the ACME webroot."
+    backup=$(mktemp -d /etc/nginx/sites-available/.x-ui-pro-acme.XXXXXXXX) || fail "Could not stage the ACME configuration."
+
+    restore_acme_config() {
+        rm -f -- "$available" "$enabled" || return 1
+        if [[ -e $backup/available || -L $backup/available ]]; then
+            cp -a -- "$backup/available" "$available" || return 1
+        fi
+        if [[ -e $backup/enabled || -L $backup/enabled ]]; then
+            cp -a -- "$backup/enabled" "$enabled" || return 1
+        fi
+        case $nginx_action in
+            reload) nginx -t && systemctl reload nginx;;
+            start) systemctl stop nginx;;
+        esac
+    }
+    finish_acme() {
+        if [[ $changed == yes && $keep_config == no ]] && ! restore_acme_config; then
+            msg_err "Could not restore the ACME configuration. Backup: $backup" >&2
+            return
+        fi
+        rm -f -- "$backup/available" "$backup/enabled" "$backup/staged"
+        rmdir -- "$backup"
+    }
+    trap finish_acme EXIT
+    trap 'exit 1' HUP INT TERM
+    for host in "$available" "$enabled"; do
+        [[ ! -d $host || -L $host ]] || fail "Expected an Nginx configuration file at $host."
+    done
+    if [[ -e $available || -L $available ]]; then
+        cp -a -- "$available" "$backup/available" || fail "Could not save the existing ACME configuration."
+    fi
+    if [[ -e $enabled || -L $enabled ]]; then
+        cp -a -- "$enabled" "$backup/enabled" || fail "Could not save the enabled ACME configuration."
+    fi
+    cat > "$backup/staged" <<EOF || fail "Could not write the ACME configuration."
 server {
     listen 80;
     listen [::]:80;
@@ -449,13 +518,24 @@ server {
     location / { return 301 https://\$host\$request_uri; }
 }
 EOF
-ln -sfn /etc/nginx/sites-available/80.conf /etc/nginx/sites-enabled/80.conf
-nginx -t && systemctl reload-or-restart nginx || fail "Could not serve the ACME challenge."
-for host in "${certbot_hosts[@]}"; do
-    certbot certonly --webroot -w /var/lib/letsencrypt --non-interactive --agree-tos \
-        --register-unsafely-without-email --keep-until-expiring --cert-name "$host" -d "$host" ||
-        fail "Could not issue certificate for $host. Check DNS and TCP port 80."
-done
+    changed=yes
+    mv -fT -- "$backup/staged" "$available" && ln -sfn -- "$available" "$enabled" ||
+        fail "Could not enable the ACME configuration."
+    nginx -t || fail "Could not validate the ACME configuration."
+    if systemctl is-active --quiet nginx; then
+        nginx_action=reload
+    else
+        nginx_action=start
+    fi
+    systemctl "$nginx_action" nginx || fail "Could not serve the ACME challenge."
+    for host in "${certbot_hosts[@]}"; do
+        certbot certonly --webroot -w /var/lib/letsencrypt --non-interactive --agree-tos \
+            --register-unsafely-without-email --keep-until-expiring --cert-name "$host" -d "$host" ||
+            fail "Could not issue certificate for $host. Review Certbot's error before retrying."
+    done
+    keep_config=yes
+)
+issue_certificates || exit 1
 ################################# Access to configs only with cloudflare#################################
 
 ports=()
@@ -571,6 +651,12 @@ server {
 EOF
 
 cat > "/etc/nginx/snippets/includes.conf" << EOF
+        proxy_ssl_server_name on;
+        proxy_ssl_name $domain;
+        proxy_ssl_verify on;
+        proxy_ssl_verify_depth 3;
+        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+
   	#sub2sing-box
 	location /${sub2singbox_path}/ {
 		proxy_redirect off;
@@ -601,7 +687,7 @@ cat > "/etc/nginx/snippets/includes.conf" << EOF
                 proxy_set_header Host \$host;
                 proxy_set_header X-Real-IP \$remote_addr;
                 proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_pass http://127.0.0.1:${sub_port};
+                proxy_pass https://127.0.0.1:${sub_port};
                 break;
         }
 	location ^~ /${sub_path}/ {
@@ -610,7 +696,7 @@ cat > "/etc/nginx/snippets/includes.conf" << EOF
                 proxy_set_header Host \$host;
                 proxy_set_header X-Real-IP \$remote_addr;
                 proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_pass http://127.0.0.1:${sub_port};
+                proxy_pass https://127.0.0.1:${sub_port};
                 break;
         }
 	location /assets/ {
@@ -619,7 +705,7 @@ cat > "/etc/nginx/snippets/includes.conf" << EOF
                 proxy_set_header Host \$host;
                 proxy_set_header X-Real-IP \$remote_addr;
                 proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_pass http://127.0.0.1:${sub_port};
+                proxy_pass https://127.0.0.1:${sub_port};
                 break;
         }
 	location /assets {
@@ -628,7 +714,7 @@ cat > "/etc/nginx/snippets/includes.conf" << EOF
                 proxy_set_header Host \$host;
                 proxy_set_header X-Real-IP \$remote_addr;
                 proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_pass http://127.0.0.1:${sub_port};
+                proxy_pass https://127.0.0.1:${sub_port};
                 break;
         }
 	#Subscription Path (json/fragment)
@@ -638,7 +724,7 @@ cat > "/etc/nginx/snippets/includes.conf" << EOF
                 proxy_set_header Host \$host;
                 proxy_set_header X-Real-IP \$remote_addr;
                 proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_pass http://127.0.0.1:${sub_port};
+                proxy_pass https://127.0.0.1:${sub_port};
                 break;
         }
 	location ^~ /${json_path}/ {
@@ -647,7 +733,7 @@ cat > "/etc/nginx/snippets/includes.conf" << EOF
                 proxy_set_header Host \$host;
                 proxy_set_header X-Real-IP \$remote_addr;
                 proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_pass http://127.0.0.1:${sub_port};
+                proxy_pass https://127.0.0.1:${sub_port};
                 break;
         }
         #XHTTP
@@ -724,7 +810,7 @@ server {
 		proxy_set_header Host \$host;
 		proxy_set_header X-Real-IP \$remote_addr;
 		proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-		proxy_pass http://127.0.0.1:${panel_port};
+		proxy_pass https://127.0.0.1:${panel_port};
 		break;
 	}
         location /$panel_path {
@@ -732,7 +818,7 @@ server {
 		proxy_set_header Host \$host;
 		proxy_set_header X-Real-IP \$remote_addr;
 		proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-		proxy_pass http://127.0.0.1:${panel_port};
+		proxy_pass https://127.0.0.1:${panel_port};
 		break;
 	}
 include /etc/nginx/snippets/includes.conf;
@@ -744,16 +830,12 @@ if [[ -f "/etc/nginx/sites-available/${domain}" ]]; then
 	rm -f "/etc/nginx/sites-enabled/default" "/etc/nginx/sites-available/default"
 	ln -s "/etc/nginx/sites-available/${domain}" "/etc/nginx/sites-enabled/" 2>/dev/null
         ln -s "/etc/nginx/sites-available/${reality_domain}" "/etc/nginx/sites-enabled/" 2>/dev/null
-	ln -s "/etc/nginx/sites-available/80.conf" "/etc/nginx/sites-enabled/" 2>/dev/null
 else
 	msg_err "${domain} nginx config not exist!" && exit 1
 fi
 
-if [[ $(nginx -t 2>&1 | grep -o 'successful') != "successful" ]]; then
-    msg_err "nginx config is not ok!" && exit 1
-else
-	systemctl reload-or-restart nginx || fail "Could not load the Nginx configuration."
-fi
+nginx -t || fail "Could not validate the Nginx configuration."
+systemctl reload nginx || fail "Could not load the Nginx configuration."
 
 
 ##############################generate uri's###########################################################
@@ -810,8 +892,8 @@ DELETE FROM settings WHERE key IN ('subPort','subListen','subPath','subURI',
 	     INSERT INTO "settings" ("key", "value") VALUES ("timeLocation",  'Europe/Moscow');
              INSERT INTO "settings" ("key", "value") VALUES ("secretEnable",  'false');
 	     INSERT INTO "settings" ("key", "value") VALUES ("subDomain",  '');
-             INSERT INTO "settings" ("key", "value") VALUES ("subCertFile",  '');
-	     INSERT INTO "settings" ("key", "value") VALUES ("subKeyFile",  '');
+             INSERT INTO "settings" ("key", "value") VALUES ("subCertFile",  '/etc/letsencrypt/live/$domain/fullchain.pem');
+	     INSERT INTO "settings" ("key", "value") VALUES ("subKeyFile",  '/etc/letsencrypt/live/$domain/privkey.pem');
              INSERT INTO "settings" ("key", "value") VALUES ("subUpdates",  '12');
 	     INSERT INTO "settings" ("key", "value") VALUES ("subEncrypt",  'true');
              INSERT INTO "settings" ("key", "value") VALUES ("subShowInfo",  'true');
@@ -1117,21 +1199,23 @@ if [[ $hy2_enabled == yes ]]; then
     hy2_sub_id=$(printf '%s\n' "$hy2_result" | head -n1)
     hy2_link=$(printf '%s\n' "$hy2_result" | tail -n1)
 fi
+enable_db_backups
 
 ######################enable bbr and tune system########################################################
-apt-get install -yqq --no-install-recommends ca-certificates
-echo "net.core.default_qdisc=fq" | tee -a /etc/sysctl.conf
-echo "net.ipv4.tcp_congestion_control=bbr" | tee -a /etc/sysctl.conf
-echo "fs.file-max=2097152" | tee -a /etc/sysctl.conf
-echo "net.ipv4.tcp_timestamps = 1" | tee -a /etc/sysctl.conf
-echo "net.ipv4.tcp_sack = 1" | tee -a /etc/sysctl.conf
-echo "net.ipv4.tcp_window_scaling = 1" | tee -a /etc/sysctl.conf
-echo "net.core.rmem_max = 16777216" | tee -a /etc/sysctl.conf
-echo "net.core.wmem_max = 16777216" | tee -a /etc/sysctl.conf
-echo "net.ipv4.tcp_rmem = 4096 87380 16777216" | tee -a /etc/sysctl.conf
-echo "net.ipv4.tcp_wmem = 4096 65536 16777216" | tee -a /etc/sysctl.conf
+if [[ $skip_sysctl == no ]]; then
+    echo "net.core.default_qdisc=fq" | tee -a /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control=bbr" | tee -a /etc/sysctl.conf
+    echo "fs.file-max=2097152" | tee -a /etc/sysctl.conf
+    echo "net.ipv4.tcp_timestamps = 1" | tee -a /etc/sysctl.conf
+    echo "net.ipv4.tcp_sack = 1" | tee -a /etc/sysctl.conf
+    echo "net.ipv4.tcp_window_scaling = 1" | tee -a /etc/sysctl.conf
+    echo "net.core.rmem_max = 16777216" | tee -a /etc/sysctl.conf
+    echo "net.core.wmem_max = 16777216" | tee -a /etc/sysctl.conf
+    echo "net.ipv4.tcp_rmem = 4096 87380 16777216" | tee -a /etc/sysctl.conf
+    echo "net.ipv4.tcp_wmem = 4096 65536 16777216" | tee -a /etc/sysctl.conf
 
-sysctl -p
+    sysctl -p
+fi
 
 
 ######################install_sub2sing-box#################################################################
@@ -1215,19 +1299,16 @@ if ! grep -Fq '/usr/bin/sub2sing-box server' <<<"$existing_crontab"; then
     { printf '%s\n' "$existing_crontab"; printf '%s\n' '@reboot /usr/bin/sub2sing-box server --bind 127.0.0.1 --port 8080 > /dev/null 2>&1'; } | crontab -
 fi
 ##################################ufw###################################################################
-ufw allow 22/tcp
-ufw allow 80/tcp
-ufw allow 443/tcp
-if [[ $hy2_enabled == yes ]]; then
-    ufw allow "$hy2_port/udp" || fail "Could not update UFW for Hy2."
-else
-    ufw allow 443/udp
+if [[ $skip_ufw == no ]]; then
+    ufw_udp_port=443
+    [[ $hy2_enabled == no ]] || ufw_udp_port=$hy2_port
+    ufw allow 22/tcp && ufw allow 80/tcp && ufw allow 443/tcp &&
+        ufw allow "$ufw_udp_port/udp" && ufw --force enable ||
+        fail "Could not configure UFW."
 fi
-ufw --force enable  
 if [[ $hy2_enabled == yes ]]; then
     verify_subscriptions
 fi
-enable_db_backups
 ##################################Show Details##########################################################
 
 if systemctl is-active --quiet x-ui; then
