@@ -1265,7 +1265,7 @@ DEST_DIR_SUB_PAGE="/var/www/subpage"
 DEST_FILE_SUB_PAGE="$DEST_DIR_SUB_PAGE/index.html"
 DEST_FILE_CLASH_SUB="$DEST_DIR_SUB_PAGE/clash.yaml"
 
-sudo mkdir -p "$DEST_DIR_SUB_PAGE"
+install -d -m 0755 "$DEST_DIR_SUB_PAGE" || fail "Could not prepare the subscription template directory."
 
 curl -fsSL "${URL_CLASH_SUB[$CLASH]}" -o "$DEST_FILE_CLASH_SUB" || fail "Could not download the Clash subscription template."
 curl -fsSL "${URL_SUB_PAGE[$CUSTOMWEBSUB]}" -o "$DEST_FILE_SUB_PAGE" || fail "Could not download the subscription page."
@@ -1276,6 +1276,9 @@ sed -i "s#\${SUB_JSON_PATH}#$json_path#g" "$DEST_FILE_SUB_PAGE"
 sed -i "s#\${SUB_PATH}#$sub_path#g" "$DEST_FILE_SUB_PAGE"
 sed -i "s#\${SUB_PATH}#$sub_path#g" "$DEST_FILE_CLASH_SUB"
 sed -i "s|sub.legiz.ru|$domain/$sub2singbox_path|g" "$DEST_FILE_SUB_PAGE"
+
+# Nginx workers serve these public files even when the installer runs with umask 077.
+chmod 0644 "$DEST_FILE_SUB_PAGE" "$DEST_FILE_CLASH_SUB" || fail "Could not set subscription template permissions."
 
 #while true; do	
 #	if [[ -n "$tg_escaped_link" ]]; then
