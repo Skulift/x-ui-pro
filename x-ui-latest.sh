@@ -1,6 +1,5 @@
 #!/bin/bash
 #################### x-ui-pro v2.4.3 @ github.com/GFW4Fun ##############################################
-[[ $EUID -ne 0 ]] && echo "not root!" && sudo su -
 ##############################INFO######################################################################
 msg_ok() { echo -e "\e[1;42m $1 \e[0m";}
 msg_err() { echo -e "\e[1;41m $1 \e[0m";}
@@ -9,17 +8,16 @@ echo;msg_inf '           ___    _   _   _  '	;
 msg_inf		 ' \/ __ | |  | __ |_) |_) / \ '	;
 msg_inf		 ' /\    |_| _|_   |   | \ \_/ '	; echo
 ##################################Variables#############################################################
-XUIDB="/etc/x-ui/x-ui.db";domain="";UNINSTALL="x";INSTALL="n";PNLNUM=1;CFALLOW="n";CLASH=0;CUSTOMWEBSUB=0
+XUIDB="/etc/x-ui/x-ui.db";domain="";INSTALL="n";PNLNUM=1;CFALLOW="n";CLASH=0;CUSTOMWEBSUB=0
 Pak=$(type apt &>/dev/null && echo "apt" || echo "yum")
-systemctl stop x-ui
-rm -rf /etc/systemd/system/x-ui.service
-rm -rf /usr/local/x-ui
-rm -rf /etc/x-ui
-rm -rf /etc/nginx/sites-enabled/*
-rm -rf /etc/nginx/sites-available/*
-rm -rf /etc/nginx/stream-enabled/*
-
-
+panel_version=v3.11.0
+hy2_enabled=yes
+hy2_port=443
+hy2_mode=install
+hy2_domain=
+hy2_cert=
+hy2_key=
+hy2_panel_url=
 ##################################generate ports and paths#############################################################
 get_port() {
 	echo $(( ((RANDOM<<15)|RANDOM) % 49152 + 10000 ))
@@ -32,7 +30,7 @@ gen_random_string() {
 }
 check_free() {
 	local port=$1
-	nc -z 127.0.0.1 $port &>/dev/null
+	[[ -n $(ss -H -ltn "sport = :$port") ]]
 	return $?
 }
 
@@ -46,35 +44,36 @@ make_port() {
 	done
 }
 
-sub_port=$(make_port)
-panel_port=$(make_port)
-web_path=$(gen_random_string 10)
-sub2singbox_path=$(gen_random_string 10)
-sub_path=$(gen_random_string 10)
-json_path=$(gen_random_string 10)
-panel_path=$(gen_random_string 10)
-ws_port=$(make_port)
-trojan_port=$(make_port)
-ws_path=$(gen_random_string 10)
-trojan_path=$(gen_random_string 10)
-xhttp_path=$(gen_random_string 10)
-config_username=$(gen_random_string 10)
-config_password=$(gen_random_string 10)
-AUTODOMAIN="n"
-
-##################################Random Port and Path #################################################
-#RNDSTR=$(tr -dc A-Za-z0-9 </dev/urandom | head -c "$(shuf -i 6-12 -n 1)")
-#while true; do 
-#    PORT=$(( ((RANDOM<<15)|RANDOM) % 49152 + 10000 ))
-#    status="$(nc -z 127.0.0.1 $PORT < /dev/null &>/dev/null; echo $?)"
-#    if [ "${status}" != "0" ]; then
-#        break
-#    fi
-#done
+reality_domain=
 
 ################################Get arguments###########################################################
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --add-hy2) hy2_mode=add; shift; continue;;
+    --no-hy2) hy2_enabled=no; shift; continue;;
+    --help|-h)
+      cat <<'USAGE'
+Fresh installation (Debian/Ubuntu, systemd):
+  sudo bash x-ui-latest.sh -install yes [-subdomain HOST -reality_domain HOST]
+    [--hy2-port PORT] [--hy2-domain HOST --hy2-cert FULLCHAIN --hy2-key PRIVATE_KEY]
+    [--no-hy2]
+Add Hy2 to an existing 3x-ui installation:
+  sudo bash x-ui-latest.sh --add-hy2 --panel-url https://HOST/PANEL_PATH/
+    --hy2-domain HOST [--hy2-port PORT] [--hy2-cert FULLCHAIN --hy2-key PRIVATE_KEY]
+USAGE
+      exit 0;;
+  esac
+  if [[ $# -lt 2 || $2 == -* ]]; then
+    msg_err "Missing value for $1"
+    exit 2
+  fi
+  case "$1" in
+    --panel-url) hy2_panel_url="$2"; shift 2;;
+    --hy2-domain) hy2_domain="$2"; shift 2;;
+    --hy2-port) hy2_port="$2"; shift 2;;
+    --hy2-cert) hy2_cert="$2"; shift 2;;
+    --hy2-key) hy2_key="$2"; shift 2;;
+    --*) msg_err "Unknown option: $1"; exit 2;;
     -auto_domain) AUTODOMAIN="$2"; shift 2;;
     -install) INSTALL="$2"; shift 2;;
     -panel) PNLNUM="$2"; shift 2;;
@@ -83,27 +82,183 @@ while [ "$#" -gt 0 ]; do
     -ONLY_CF_IP_ALLOW) CFALLOW="$2"; shift 2;;
     -websub) CUSTOMWEBSUB="$2"; shift 2;;
     -clash) CLASH="$2"; shift 2;;
-    -uninstall) UNINSTALL="$2"; shift 2;;
-    *) shift 1;;
+    *) msg_err "Unknown option: $1"; exit 2;;
   esac
 done
 
 
-##############################Uninstall#################################################################
-UNINSTALL_XUI(){
-	printf 'y\n' | x-ui uninstall
-	rm -rf "/etc/x-ui/" "/usr/local/x-ui/" "/usr/bin/x-ui/"
-	$Pak -y remove nginx nginx-common nginx-core nginx-full python3-certbot-nginx
-	$Pak -y purge nginx nginx-common nginx-core nginx-full python3-certbot-nginx
-	$Pak -y autoremove
-	$Pak -y autoclean
-	rm -rf "/var/www/html/" "/etc/nginx/" "/usr/share/nginx/" 
+fail() {
+    msg_err "$*" >&2
+    exit 1
 }
-if [[ ${UNINSTALL} == *"y"* ]]; then
-	UNINSTALL_XUI	
-	clear && msg_ok "Completely Uninstalled!" && exit 1
+
+valid_domain() {
+    [[ $1 =~ ^([[:alnum:]]([[:alnum:]-]{0,61}[[:alnum:]])?\.)+[[:alpha:]][[:alnum:]-]{0,61}[[:alnum:]]$ && ${#1} -le 253 ]]
+}
+
+check_udp_port() {
+    local listeners
+    listeners=$(ss -H -aun "sport = :$hy2_port") || fail "Could not check UDP listeners."
+    [[ -z $listeners ]] || fail "UDP $hy2_port is already in use. Choose --hy2-port."
+}
+
+panel_request() {
+    local method=$1 path=$2
+    shift 2
+    curl -fsS --noproxy '*' --connect-timeout 5 --max-time 25 "${hy2_resolve[@]}" \
+        -b "$session_file" -c "$session_file" -H 'X-Requested-With: XMLHttpRequest' \
+        -H "X-CSRF-Token: $csrf" -X "$method" "$hy2_panel_url/$path" "$@"
+}
+
+verify_subscriptions() {
+    local raw decoded json
+    local -a request=(--noproxy '*' --resolve "$domain:443:127.0.0.1"
+                     -fsS --retry 3 --connect-timeout 5 --max-time 15)
+    raw=$(curl "${request[@]}" -H 'User-Agent: v2rayN/7.0' "$sub_uri$hy2_sub_id") ||
+        fail "The public URL for the standard subscription did not respond."
+    decoded=$(printf '%s' "$raw" | base64 -d) ||
+        fail "The standard subscription did not return a Base64 config."
+    grep -q '^hysteria2://' <<<"$decoded" ||
+        fail "The standard subscription is missing the Hysteria 2 link."
+    json=$(curl "${request[@]}" -H 'User-Agent: v2rayN/7.0' "$json_uri$hy2_sub_id") ||
+        fail "The public URL for the JSON subscription did not respond."
+    jq -e 'any(.. | objects; .protocol? == "hysteria" or .protocol? == "hysteria2")' >/dev/null <<<"$json" ||
+        fail "The JSON subscription did not return a JSON config."
+}
+
+add_hy2() (
+    umask 077
+    local work_dir session_file csrf= result inbounds auth mask email subid payload
+    local cert_fingerprint key_fingerprint
+    [[ $hy2_panel_url =~ ^https?://[[:alnum:].:-]+(/[[:alnum:]_.~-]+)*/?$ ]] ||
+        fail "Set --panel-url to the HTTPS URL of your panel, including its base path."
+    hy2_panel_url=${hy2_panel_url%/}
+    if [[ $hy2_panel_url == http://* && ! $hy2_panel_url =~ ^http://(127\.0\.0\.1|localhost)(:[0-9]+)?(/|$) ]]; then
+        fail "Use HTTPS for a remote panel URL."
+    fi
+    valid_domain "$hy2_domain" || fail "Set --hy2-domain to a valid DNS hostname."
+    work_dir=$(mktemp -d) || fail "Could not create a temporary session directory."
+    trap 'rm -f "$work_dir/cookies"; rmdir "$work_dir"' EXIT
+    session_file=$work_dir/cookies
+    touch "$session_file" || fail "Could not create session file."
+    csrf=$(panel_request GET csrf-token --retry 4 --retry-connrefused | jq -er '.obj | strings') ||
+        fail "Unable to open a 3x-ui session. Check the panel URL and version."
+    local two_factor=
+    if [[ -z ${hy2_username:-} ]]; then
+        read -r -p '3x-ui username: ' hy2_username </dev/tty || fail "Cannot read panel login."
+        read -r -s -p '3x-ui password: ' hy2_password </dev/tty || fail "Cannot read panel password."
+        printf '\n' >&2
+        read -r -s -p '3x-ui 2FA code (Enter if disabled): ' two_factor </dev/tty ||
+            fail "Cannot read the 2FA code."
+        printf '\n' >&2
+    fi
+    result=$(printf '%s\0%s\0%s\0' "$hy2_username" "$hy2_password" "$two_factor" |
+        jq -Rs 'split("\u0000") | {username:.[0],password:.[1],twoFactorCode:(.[2] // "")}' |
+        panel_request POST login -H 'Content-Type: application/json' --data-binary @-) ||
+        fail "3x-ui login request failed."
+    jq -e '.success == true' >/dev/null <<<"$result" || fail "3x-ui refused the login."
+    csrf=$(panel_request GET csrf-token | jq -er '.obj | strings') || fail "Could not refresh the panel session."
+    inbounds=$(panel_request GET panel/api/inbounds/list) || fail "Could not list 3x-ui inbounds."
+    jq -e '.success == true and (.obj | type == "array" or . == null)' >/dev/null <<<"$inbounds" ||
+        fail "3x-ui returned an invalid inbound list."
+    if jq -e '.obj[]? | select(.protocol == "hysteria" and .remark == "Hysteria 2 (x-ui-pro)" and (.nodeId // 0) == 0)' \
+        >/dev/null <<<"$inbounds"; then
+        fail "Managed Hy2 already exists. Its settings and links were preserved. Use 3x-ui to view or edit it."
+    fi
+    check_udp_port
+
+    hy2_cert=${hy2_cert:-/etc/letsencrypt/live/$hy2_domain/fullchain.pem}
+    hy2_key=${hy2_key:-/etc/letsencrypt/live/$hy2_domain/privkey.pem}
+    openssl x509 -in "$hy2_cert" -checkend 0 -noout >/dev/null &&
+        openssl x509 -in "$hy2_cert" -checkhost "$hy2_domain" -noout |
+            grep -q 'does match certificate' ||
+        fail "Provide an unexpired certificate for $hy2_domain (--hy2-cert and --hy2-key)."
+    cert_fingerprint=$(openssl x509 -in "$hy2_cert" -pubkey -noout) &&
+        key_fingerprint=$(openssl pkey -in "$hy2_key" -pubout) &&
+        [[ $cert_fingerprint == "$key_fingerprint" ]] || fail "The certificate and key do not match."
+
+    if [[ $hy2_mode == add ]]; then
+        [[ -f $XUIDB ]] || fail "This add mode requires a local 3x-ui SQLite database at $XUIDB."
+        local backup
+        backup=$(mktemp /etc/x-ui/x-ui-before-hy2.XXXXXXXX) || fail "Cannot allocate backup."
+        sqlite3 -bail "$XUIDB" ".backup '$backup'" || fail "3x-ui database backup failed."
+        printf 'Database backup: %s\n' "$backup" >&2
+    fi
+
+    auth=$(openssl rand -hex 24) && mask=$(openssl rand -hex 24) &&
+        subid=$(openssl rand -hex 12) && email="hy2-$(openssl rand -hex 6)" ||
+        fail "Could not generate Hysteria 2 credentials."
+    payload=$(printf '%s\n%s\n' "$auth" "$mask" |
+        jq -Rs --argjson port "$hy2_port" --arg host "$hy2_domain" \
+            --arg cert "$hy2_cert" --arg key "$hy2_key" --arg email "$email" --arg sid "$subid" '
+        split("\n") as [$auth, $mask] | {
+            remark:"Hysteria 2 (x-ui-pro)", enable:true, port:$port,
+            listen:"", protocol:"hysteria",
+            shareAddrStrategy:"custom",shareAddr:$host,
+            settings:({version:2,clients:[{email:$email, auth:$auth,subId:$sid,enable:true}]} | tojson),
+            streamSettings:({
+                network:"hysteria", hysteriaSettings:{version:2,udpIdleTimeout:60},
+                security:"tls",tlsSettings:{
+                    serverName:$host, minVersion:"1.3", alpn:["h3"],
+                    certificates:[{certificateFile:$cert,keyFile:$key,usage:"encipherment"}]
+                },
+                finalmask:{udp:[{type:"salamander",settings:{password:$mask}}]}
+            } | tojson), sniffing:({enabled:false} | tojson)
+        }') || fail "Could not build the Hy2 inbound."
+    result=$(printf '%s' "$payload" |
+        panel_request POST panel/api/inbounds/add -H 'Content-Type: application/json' --data-binary @-) ||
+        fail "Could not submit the Hy2 inbound."
+    jq -e '.success == true' >/dev/null <<<"$result" || {
+        jq -r '.msg // "3x-ui rejected the Hy2 inbound."' >&2 <<<"$result"
+        fail "Hysteria 2 creation failed."
+    }
+
+    local listening attempt
+    listening=$(ss -H -aunp "sport = :$hy2_port")
+    if [[ $listening != *xray* ]]; then
+        result=$(panel_request POST panel/api/server/restartXrayService) &&
+            jq -e '.success == true' >/dev/null <<<"$result" ||
+            fail "Hy2 was saved, but the panel could not restart Xray. Check its logs."
+    fi
+    for (( attempt=0; attempt<20; attempt++ )); do
+        listening=$(ss -H -aunp "sport = :$hy2_port")
+        [[ $listening == *xray* ]] && break
+        sleep 1
+    done
+    [[ $listening == *xray* ]] ||
+        fail "Hy2 was created, but Xray did not open UDP $hy2_port. Check journalctl -u x-ui."
+
+    if [[ $hy2_mode == add ]] && command -v ufw >/dev/null &&
+        LANG=C ufw status | grep -q '^Status: active'; then
+        ufw allow "$hy2_port/udp" >&2 || fail "Could not update UFW for Hy2."
+    fi
+    printf '%s\n' "$subid"
+    printf 'hysteria2://%s@%s:%s/?sni=%s&obfs=salamander&obfs-password=%s#Hysteria-2\n' \
+        "$auth" "$hy2_domain" "$hy2_port" "$hy2_domain" "$mask"
+)
+
+if [[ $EUID -ne 0 ]]; then
+    fail "Run this script as root (sudo bash)."
+fi
+[[ $hy2_port =~ ^[1-9][0-9]{0,4}$ && $hy2_port -le 65535 ]] ||
+    fail "Invalid UDP port. Use a value from 1 to 65535."
+exec 9>/run/lock/x-ui-pro-install.lock
+flock -n 9 || fail "Another x-ui-pro operation is running."
+hy2_resolve=()
+if [[ $hy2_mode == add ]]; then
+    [[ $hy2_enabled == yes ]] || fail "--add-hy2 cannot be combined with --no-hy2."
+    for command in curl jq openssl sqlite3 ss; do
+        command -v "$command" >/dev/null || fail "Missing dependency: $command"
+    done
+    hy2_result=$(add_hy2) || exit 1
+    printf 'Hysteria 2: %s\n' "${hy2_result#*$'\n'}"
+    exit 0
 fi
 
+
+if [[ -e $XUIDB || -e /usr/local/x-ui/x-ui || -e /etc/systemd/system/x-ui.service ]]; then
+    fail "Existing 3x-ui found. Use --add-hy2 to keep its configuration."
+fi
 
 # --- get public IPv4 early (for auto-domain mode)
 IP4_REGEX="^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$"
@@ -151,8 +306,13 @@ if [[ "${RealitySubDomain}.${RealityMainDomain}" != "${reality_domain}" ]] ; the
 	RealityMainDomain=${reality_domain}
 fi
 
+valid_domain "$domain" && valid_domain "$reality_domain" || fail "Enter valid DNS hostnames."
+[[ ${domain,,} != "${reality_domain,,}" ]] || fail "Panel and REALITY domains must be different."
+if [[ $hy2_enabled == yes ]]; then
+    hy2_domain=$(printf '%s' "${hy2_domain:-$domain}" | tr '[:upper:]' '[:lower:]')
+    valid_domain "$hy2_domain" || fail "Enter a valid Hy2 hostname."
+fi
 ###############################Install Packages#########################################################
-ufw disable
 if [[ ${INSTALL} == *"y"* ]]; then
 
          version=$(grep -oP '(?<=VERSION_ID=")[0-9]+' /etc/os-release)
@@ -164,12 +324,12 @@ if [[ ${INSTALL} == *"y"* ]]; then
 
 	$Pak -y update
 
-	$Pak -y install curl wget jq bash sudo nginx-full certbot python3-certbot-nginx sqlite3 ufw
+	$Pak -y install curl wget jq bash sudo nginx-full certbot python3-certbot-nginx sqlite3 ufw iproute2 openssl || fail "Package installation failed."
 
 	systemctl daemon-reload && systemctl enable --now nginx
 fi
-systemctl stop nginx 
-fuser -k 80/tcp 80/udp 443/tcp 443/udp 2>/dev/null
+command -v ss >/dev/null || fail "Missing iproute2. Re-run with -install yes."
+[[ $hy2_enabled == no ]] || check_udp_port
 ##################################GET SERVER IPv4-6#####################################################
 IP4_REGEX="^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$"
 IP6_REGEX="([a-f0-9:]+:+)+[a-f0-9]+"
@@ -199,33 +359,47 @@ if [[ ${AUTODOMAIN} == *"y"* ]]; then
 fi
 
 
-certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$domain"
-if [[ ! -d "/etc/letsencrypt/live/${domain}/" ]]; then
- 	systemctl start nginx >/dev/null 2>&1
-	msg_err "$domain SSL could not be generated! Check Domain/IP Or Enter new domain!" && exit 1
+install -d -m 0755 /var/lib/letsencrypt/.well-known/acme-challenge
+install -d -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled
+certbot_hosts=("$domain" "$reality_domain")
+if [[ $hy2_enabled == yes && -z $hy2_cert && -z $hy2_key &&
+      $hy2_domain != "$domain" && $hy2_domain != "$reality_domain" ]]; then
+    certbot_hosts+=("$hy2_domain")
 fi
-
-certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$reality_domain"
-if [[ ! -d "/etc/letsencrypt/live/${reality_domain}/" ]]; then
- 	systemctl start nginx >/dev/null 2>&1
-	msg_err "$reality_domain SSL could not be generated! Check Domain/IP Or Enter new domain!" && exit 1
-fi
+[[ -z $hy2_cert && -z $hy2_key || -n $hy2_cert && -n $hy2_key ]] ||
+    fail "Provide both --hy2-cert and --hy2-key."
+cat > /etc/nginx/sites-available/80.conf <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${certbot_hosts[*]};
+    location ^~ /.well-known/acme-challenge/ { root /var/lib/letsencrypt; }
+    location / { return 301 https://\$host\$request_uri; }
+}
+EOF
+ln -sfn /etc/nginx/sites-available/80.conf /etc/nginx/sites-enabled/80.conf
+nginx -t && systemctl reload-or-restart nginx || fail "Could not serve the ACME challenge."
+for host in "${certbot_hosts[@]}"; do
+    certbot certonly --webroot -w /var/lib/letsencrypt --non-interactive --agree-tos \
+        --register-unsafely-without-email --keep-until-expiring --cert-name "$host" -d "$host" ||
+        fail "Could not issue certificate for $host. Check DNS and TCP port 80."
+done
 ################################# Access to configs only with cloudflare#################################
 
-###################################Get Installed XUI Port/Path##########################################
-if [[ -f $XUIDB ]]; then
-	XUIPORT=$(sqlite3 -list $XUIDB 'SELECT "value" FROM settings WHERE "key"="webPort" LIMIT 1;' 2>&1)
-	XUIPATH=$(sqlite3 -list $XUIDB 'SELECT "value" FROM settings WHERE "key"="webBasePath" LIMIT 1;' 2>&1)
-if [[ $XUIPORT -gt 0 && $XUIPORT != "54321" && $XUIPORT != "2053" ]] && [[ ${#XUIPORT} -gt 4 ]]; then
-	RNDSTR=$(echo "$XUIPATH" 2>&1 | tr -d '/')
-	PORT=$XUIPORT
-	sqlite3 $XUIDB <<EOF
-	DELETE FROM "settings" WHERE ( "key"="webCertFile" ) OR ( "key"="webKeyFile" ); 
-	INSERT INTO "settings" ("key", "value") VALUES ("webCertFile",  "");
-	INSERT INTO "settings" ("key", "value") VALUES ("webKeyFile", "");
-EOF
-fi
-fi
+ports=()
+for name in sub_port panel_port ws_port trojan_port; do
+    while :; do
+        candidate=$(make_port)
+        [[ " ${ports[*]} " != *" $candidate "* && $candidate != 8443 && $candidate != 9443 ]] && break
+    done
+    ports+=("$candidate")
+    printf -v "$name" '%s' "$candidate"
+done
+for name in web_path sub2singbox_path sub_path json_path panel_path ws_path trojan_path xhttp_path; do
+    printf -v "$name" '%s' "$(openssl rand -hex 12)"
+done
+config_username=$(openssl rand -hex 10)
+config_password=$(openssl rand -hex 24)
 #################################Nginx Config###########################################################
 mkdir -p /root/cert/${domain}
 chmod 755 /root/cert/*
@@ -263,18 +437,8 @@ EOF
 
 grep -xqFR "stream { include /etc/nginx/stream-enabled/*.conf; }" /etc/nginx/* ||echo "stream { include /etc/nginx/stream-enabled/*.conf; }" >> /etc/nginx/nginx.conf
 grep -xqFR "load_module modules/ngx_stream_module.so;" /etc/nginx/* || sed -i '1s/^/load_module \/usr\/lib\/nginx\/modules\/ngx_stream_module.so; /' /etc/nginx/nginx.conf
-grep -xqFR "load_module modules/ngx_stream_geoip2_module.so;" /etc/nginx* || sed -i '2s/^/load_module \/usr\/lib\/nginx\/modules\/ngx_stream_geoip2_module.so; /' /etc/nginx/nginx.conf
 grep -xqFR "worker_rlimit_nofile 16384;" /etc/nginx/* ||echo "worker_rlimit_nofile 16384;" >> /etc/nginx/nginx.conf
 sed -i "/worker_connections/c\worker_connections 4096;" /etc/nginx/nginx.conf
-cat > "/etc/nginx/sites-available/80.conf" << EOF
-server {
-    listen 80;
-    server_name ${domain} ${reality_domain};
-    return 301 https://\$host\$request_uri;
-}
-EOF
-
-
 cat > "/etc/nginx/sites-available/${domain}" << EOF
 server {
 	server_tokens off;
@@ -282,7 +446,7 @@ server {
 	listen 7443 ssl http2 proxy_protocol;
 	listen [::]:7443 ssl http2 proxy_protocol;
 	index index.html index.htm index.php index.nginx-debian.html;
-	root /var/www/html/;
+	root /var/www/x-ui-pro/;
 	ssl_protocols TLSv1.2 TLSv1.3;
 	ssl_ciphers HIGH:!aNULL:!eNULL:!MD5:!DES:!RC4:!ADH:!SSLv3:!EXP:!PSK:!DSS;
 	ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
@@ -365,16 +529,16 @@ cat > "/etc/nginx/snippets/includes.conf" << EOF
                 proxy_set_header Host \$host;
                 proxy_set_header X-Real-IP \$remote_addr;
                 proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_pass https://127.0.0.1:${sub_port};
+                proxy_pass http://127.0.0.1:${sub_port};
                 break;
         }
-	location /${sub_path}/ {
+	location ^~ /${sub_path}/ {
                 if (\$hack = 1) {return 404;}
                 proxy_redirect off;
                 proxy_set_header Host \$host;
                 proxy_set_header X-Real-IP \$remote_addr;
                 proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_pass https://127.0.0.1:${sub_port};
+                proxy_pass http://127.0.0.1:${sub_port};
                 break;
         }
 	location /assets/ {
@@ -383,7 +547,7 @@ cat > "/etc/nginx/snippets/includes.conf" << EOF
                 proxy_set_header Host \$host;
                 proxy_set_header X-Real-IP \$remote_addr;
                 proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_pass https://127.0.0.1:${sub_port};
+                proxy_pass http://127.0.0.1:${sub_port};
                 break;
         }
 	location /assets {
@@ -392,7 +556,7 @@ cat > "/etc/nginx/snippets/includes.conf" << EOF
                 proxy_set_header Host \$host;
                 proxy_set_header X-Real-IP \$remote_addr;
                 proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_pass https://127.0.0.1:${sub_port};
+                proxy_pass http://127.0.0.1:${sub_port};
                 break;
         }
 	#Subscription Path (json/fragment)
@@ -402,16 +566,16 @@ cat > "/etc/nginx/snippets/includes.conf" << EOF
                 proxy_set_header Host \$host;
                 proxy_set_header X-Real-IP \$remote_addr;
                 proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_pass https://127.0.0.1:${sub_port};
+                proxy_pass http://127.0.0.1:${sub_port};
                 break;
         }
-	location /${json_path}/ {
+	location ^~ /${json_path}/ {
                 if (\$hack = 1) {return 404;}
                 proxy_redirect off;
                 proxy_set_header Host \$host;
                 proxy_set_header X-Real-IP \$remote_addr;
                 proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_pass https://127.0.0.1:${sub_port};
+                proxy_pass http://127.0.0.1:${sub_port};
                 break;
         }
         #XHTTP
@@ -429,7 +593,7 @@ cat > "/etc/nginx/snippets/includes.conf" << EOF
           grpc_set_header X-Forwarded-Host   \$host;
           }
  	#Xray Config Path
-	location ~ ^/(?<fwdport>\d+)/(?<fwdpath>.*)\$ {
+	location ~ ^/(?<fwdport>${ws_port}|${trojan_port})/(?<fwdpath>.*)\$ {
 		if (\$hack = 1) {return 404;}
 		client_max_body_size 0;
 		client_body_timeout 1d;
@@ -448,15 +612,15 @@ cat > "/etc/nginx/snippets/includes.conf" << EOF
 		#proxy_set_header CF-IPCountry \$http_cf_ipcountry;
 		#proxy_set_header CF-IP \$realip_remote_addr;
 		if (\$content_type ~* "GRPC") {
-			grpc_pass grpc://127.0.0.1:\$fwdport\$is_args\$args;
+			grpc_pass grpc://127.0.0.1:\$fwdport;
 			break;
 		}
 		if (\$http_upgrade ~* "(WEBSOCKET|WS)") {
-			proxy_pass http://127.0.0.1:\$fwdport\$is_args\$args;
+			proxy_pass http://127.0.0.1:\$fwdport;
 			break;
 	        }
 		if (\$request_method ~* ^(PUT|POST|GET)\$) {
-			proxy_pass http://127.0.0.1:\$fwdport\$is_args\$args;
+			proxy_pass http://127.0.0.1:\$fwdport;
 			break;
 		}
 	}
@@ -470,7 +634,7 @@ server {
 	listen 9443 ssl http2;
 	listen [::]:9443 ssl http2;
 	index index.html index.htm index.php index.nginx-debian.html;
-	root /var/www/html/;
+	root /var/www/x-ui-pro/;
 	ssl_protocols TLSv1.2 TLSv1.3;
 	ssl_ciphers HIGH:!aNULL:!eNULL:!MD5:!DES:!RC4:!ADH:!SSLv3:!EXP:!PSK:!DSS;
 	ssl_certificate /etc/letsencrypt/live/$reality_domain/fullchain.pem;
@@ -516,37 +680,43 @@ fi
 if [[ $(nginx -t 2>&1 | grep -o 'successful') != "successful" ]]; then
     msg_err "nginx config is not ok!" && exit 1
 else
-	systemctl start nginx 
+	systemctl reload-or-restart nginx || fail "Could not load the Nginx configuration."
 fi
 
 
 ##############################generate uri's###########################################################
 sub_uri=https://${domain}/${sub_path}/
-json_uri=https://${domain}/${web_path}?name=
+json_uri=https://${domain}/${json_path}/
 ##############################generate keys###########################################################
 shor=($(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8))
 
 ########################################Update X-UI Port/Path for first INSTALL#########################
 UPDATE_XUIDB(){
 if [[ -f $XUIDB ]]; then
-        x-ui stop
-        output=$(/usr/local/x-ui/bin/xray-linux-amd64 x25519)
+        output=$(/usr/local/x-ui/bin/xray-linux-$(arch) x25519) || fail "Xray key generation failed."
 
         private_key=$(echo "$output" | grep "^PrivateKey:" | awk '{print $2}')
-        public_key=$(echo "$output" | grep "^Password" | awk '{print $3}')
+        public_key=$(echo "$output" | awk -F ': *' '/^(Password( \(PublicKey\))?|PublicKey):/ {print $2; exit}')
 
+        [[ -n $private_key && -n $public_key ]] || fail "Invalid Xray key output."
 	trojan_pass=$(gen_random_string 10)
         emoji_flag=$(LC_ALL=en_US.UTF-8 curl -s https://ipwho.is/ | jq -r '.flag.emoji')
-       	sqlite3 $XUIDB <<EOF
+        sqlite3 -bail "$XUIDB" <<EOF || fail "Could not write initial 3x-ui settings."
+BEGIN IMMEDIATE;
+DELETE FROM settings WHERE key IN ('subPort','subListen','subPath','subURI',
+    'subJsonEnable','subJsonPath','subJsonURI','subClashEnable','subEnable',
+    'subDomain','subCertFile','subKeyFile','subEncrypt','webListen','webDomain',
+    'webCertFile','webKeyFile');
+             INSERT INTO "settings" ("key", "value") VALUES ("subListen", '127.0.0.1'), ("subJsonEnable", 'true');
              INSERT INTO "settings" ("key", "value") VALUES ("subPort",  '${sub_port}');
 	     INSERT INTO "settings" ("key", "value") VALUES ("subPath",  '/${sub_path}/');
 	     INSERT INTO "settings" ("key", "value") VALUES ("subURI",  '${sub_uri}');
-             INSERT INTO "settings" ("key", "value") VALUES ("subJsonPath",  '/${json_path}');
+             INSERT INTO "settings" ("key", "value") VALUES ("subJsonPath",  '/${json_path}/');
 	     INSERT INTO "settings" ("key", "value") VALUES ("subJsonURI",  '${json_uri}');
 		 INSERT INTO "settings" ("key", "value") VALUES ("subClashEnable",  'false');
 		 INSERT INTO "settings" ("key", "value") VALUES ("subEnableRouting",  'false');
              INSERT INTO "settings" ("key", "value") VALUES ("subEnable",  'true');
-             INSERT INTO "settings" ("key", "value") VALUES ("webListen",  '');
+             INSERT INTO "settings" ("key", "value") VALUES ("webListen",  '127.0.0.1');
 	     INSERT INTO "settings" ("key", "value") VALUES ("webDomain",  '');
              INSERT INTO "settings" ("key", "value") VALUES ("webCertFile",  '');
 	     INSERT INTO "settings" ("key", "value") VALUES ("webKeyFile",  '');
@@ -817,10 +987,8 @@ if [[ -f $XUIDB ]]; then
   "routeOnly": false
 }'
 	);
+COMMIT;
 EOF
-/usr/local/x-ui/x-ui setting -username "${config_username}" -password "${config_password}" -port "${panel_port}" -webBasePath "${panel_path}"
-/usr/local/x-ui/x-ui cert -webCert "/root/cert/${domain}/fullchain.pem" -webCertKey "/root/cert/${domain}/privkey.pem"
-x-ui start
 else
 	msg_err "x-ui.db file not exist! Maybe x-ui isn't installed." && exit 1;
 fi
@@ -838,134 +1006,44 @@ arch() {
     esac
 }
 
-config_after_install() {
-            /usr/local/x-ui/x-ui setting -username "asdfasdf" -password "asdfasdf" -port "2096" -webBasePath "asdfasdf"    
-            /usr/local/x-ui/x-ui migrate
-}
-
 install_panel() {
-apt-get update && apt-get install -y -q wget curl tar tzdata
-    cd /usr/local/
-    
-    # Download resources
-    if [ $# == 0 ]; then
-        tag_version=$(curl -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-        if [[ ! -n "$tag_version" ]]; then
-            echo -e "${yellow}Trying to fetch version with IPv4...${plain}"
-            tag_version=$(curl -4 -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-            if [[ ! -n "$tag_version" ]]; then
-                echo -e "${red}Failed to fetch x-ui version, it may be due to GitHub API restrictions, please try it later${plain}"
-                exit 1
-            fi
-        fi
-        echo -e "Got x-ui latest version: ${tag_version}, beginning the installation..."
-        wget -N -O /usr/local/x-ui-linux-$(arch).tar.gz https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz
-        if [[ $? -ne 0 ]]; then
-            echo -e "${red}Downloading x-ui failed, please be sure that your server can access GitHub ${plain}"
-            exit 1
-        fi
-    else
-        tag_version=$1
-        tag_version_numeric=${tag_version#v}
-        min_version="2.3.5"
-        
-        if [[ "$(printf '%s\n' "$min_version" "$tag_version_numeric" | sort -V | head -n1)" != "$min_version" ]]; then
-            echo -e "${red}Please use a newer version (at least v2.3.5). Exiting installation.${plain}"
-            exit 1
-        fi
-        
-        url="https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz"
-        echo -e "Beginning to install x-ui $1"
-        wget -N -O /usr/local/x-ui-linux-$(arch).tar.gz ${url}
-        if [[ $? -ne 0 ]]; then
-            echo -e "${red}Download x-ui $1 failed, please check if the version exists ${plain}"
-            exit 1
-        fi
-    fi
-    wget -O /usr/bin/x-ui-temp https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.sh
-    if [[ $? -ne 0 ]]; then
-        echo -e "${red}Failed to download x-ui.sh${plain}"
-        exit 1
-    fi
-    
-    # Stop x-ui service and remove old resources
-    if [[ -e /usr/local/x-ui/ ]]; then
-        if [[ $release == "alpine" ]]; then
-            rc-service x-ui stop
-        else
-            systemctl stop x-ui
-        fi
-        rm /usr/local/x-ui/ -rf
-    fi
-    
-    # Extract resources and set permissions
-    tar zxvf x-ui-linux-$(arch).tar.gz
-    rm x-ui-linux-$(arch).tar.gz -f
-    
-    cd x-ui
-    chmod +x x-ui
-    chmod +x x-ui.sh
-    
-    # Check the system's architecture and rename the file accordingly
-    if [[ $(arch) == "armv5" || $(arch) == "armv6" || $(arch) == "armv7" ]]; then
-        mv bin/xray-linux-$(arch) bin/xray-linux-arm
-        chmod +x bin/xray-linux-arm
-    fi
-    chmod +x x-ui bin/xray-linux-$(arch)
-    
-    # Update x-ui cli and se set permission
-    mv -f /usr/bin/x-ui-temp /usr/bin/x-ui
-    chmod +x /usr/bin/x-ui
-	config_after_install
-    
-    if [[ $release == "alpine" ]]; then
-        wget --inet4-only -O /etc/init.d/x-ui https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.rc
-        if [[ $? -ne 0 ]]; then
-            echo -e "${red}Failed to download x-ui.rc${plain}"
-            exit 1
-        fi
-        chmod +x /etc/init.d/x-ui
-        rc-update add x-ui
-        rc-service x-ui start
-    else
-        cp -f x-ui.service.debian /etc/systemd/system/x-ui.service
-        systemctl daemon-reload
-        systemctl enable x-ui
-        systemctl start x-ui
-    fi
-    
-    echo -e "${green}x-ui ${tag_version}${plain} installation finished, it is running now..."
-    echo -e ""
-    echo -e "┌───────────────────────────────────────────────────────┐
-│  ${blue}x-ui control menu usages (subcommands):${plain}              │
-│                                                       │
-│  ${blue}x-ui${plain}              - Admin Management Script          │
-│  ${blue}x-ui start${plain}        - Start                            │
-│  ${blue}x-ui stop${plain}         - Stop                             │
-│  ${blue}x-ui restart${plain}      - Restart                          │
-│  ${blue}x-ui status${plain}       - Current Status                   │
-│  ${blue}x-ui settings${plain}     - Current Settings                 │
-│  ${blue}x-ui enable${plain}       - Enable Autostart on OS Startup   │
-│  ${blue}x-ui disable${plain}      - Disable Autostart on OS Startup  │
-│  ${blue}x-ui log${plain}          - Check logs                       │
-│  ${blue}x-ui banlog${plain}       - Check Fail2ban ban logs          │
-│  ${blue}x-ui update${plain}       - Update                           │
-│  ${blue}x-ui legacy${plain}       - Legacy version                   │
-│  ${blue}x-ui install${plain}      - Install                          │
-│  ${blue}x-ui uninstall${plain}    - Uninstall                        │
-└───────────────────────────────────────────────────────┘"
-
+    local asset="x-ui-linux-$(arch).tar.gz"
+    local base="https://github.com/MHSanaei/3x-ui/releases/download/$panel_version"
+    local stage expected actual
+    stage=$(mktemp -d) || fail "Could not create download directory."
+    curl -fsSL --retry 3 "$base/$asset" -o "$stage/$asset" &&
+        curl -fsSL --retry 3 "$base/$asset.sha256" -o "$stage/checksum" ||
+        fail "Could not download 3x-ui $panel_version and its checksum."
+    expected=$(awk 'NR==1 {print $1}' "$stage/checksum")
+    actual=$(sha256sum "$stage/$asset" | awk '{print $1}')
+    [[ $expected =~ ^[[:xdigit:]]{64}$ && $expected == "$actual" ]] ||
+        fail "3x-ui archive checksum mismatch."
+    tar -xzf "$stage/$asset" -C /usr/local/ || fail "Could not extract 3x-ui."
+    rm -f "$stage/$asset" "$stage/checksum"
+    rmdir "$stage"
+    install -m 0755 /usr/local/x-ui/x-ui.sh /usr/bin/x-ui ||
+        fail "Could not install x-ui management command."
+    install -m 0644 /usr/local/x-ui/x-ui.service.debian /etc/systemd/system/x-ui.service ||
+        fail "Could not install x-ui service."
+    /usr/local/x-ui/x-ui setting -username "$config_username" -password "$config_password" \
+        -port "$panel_port" -webBasePath "$panel_path" || fail "Could not initialize the panel."
+    UPDATE_XUIDB
+    /usr/local/x-ui/x-ui cert -webCert "/etc/letsencrypt/live/$domain/fullchain.pem" \
+        -webCertKey "/etc/letsencrypt/live/$domain/privkey.pem" ||
+        fail "Could not configure the panel certificate."
+    systemctl daemon-reload && systemctl enable --now x-ui ||
+        fail "Could not start the panel."
 }
-###################################Install X-UI#########################################################
-if systemctl is-active --quiet x-ui; then
-	x-ui restart
-else
-    install_panel	
-	UPDATE_XUIDB
-	if ! systemctl is-enabled --quiet x-ui; then
-		systemctl daemon-reload && systemctl enable x-ui.service
-	fi
-	x-ui restart
+
+install_panel
+if [[ $hy2_enabled == yes ]]; then
+    hy2_panel_url="https://$domain:$panel_port/$panel_path"
+    hy2_resolve=(--resolve "$domain:$panel_port:127.0.0.1")
+    hy2_username=$config_username
+    hy2_password=$config_password
+    hy2_result=$(add_hy2) || exit 1
+    hy2_sub_id=$(printf '%s\n' "$hy2_result" | head -n1)
+    hy2_link=$(printf '%s\n' "$hy2_result" | tail -n1)
 fi
 
 ######################enable bbr and tune system########################################################
@@ -1009,9 +1087,8 @@ if wget -qO "$FAKE_SITE_TMP/repo.tar.gz" "https://github.com/mozaroc/3x-ui-pro/a
 	FAKE_SITES=("$FAKE_SITE_TMP"/site-*/)
 	FAKE_SITE="${FAKE_SITES[$((RANDOM % ${#FAKE_SITES[@]}))]}"
 	msg_inf "Random fake site template: $(basename "$FAKE_SITE")"
-	mkdir -p /var/www/html
-	rm -rf /var/www/html/*
-	cp -a "$FAKE_SITE". /var/www/html/
+	mkdir -p /var/www/x-ui-pro
+	cp -a "$FAKE_SITE". /var/www/x-ui-pro/
 	msg_ok "Fake site installed successfully!"
 else
 	msg_err "Failed to download fake site templates!"
@@ -1034,8 +1111,8 @@ DEST_FILE_CLASH_SUB="$DEST_DIR_SUB_PAGE/clash.yaml"
 
 sudo mkdir -p "$DEST_DIR_SUB_PAGE"
 
-sudo curl -L "${URL_CLASH_SUB[$CLASH]}" -o "$DEST_FILE_CLASH_SUB"
-sudo curl -L "${URL_SUB_PAGE[$CUSTOMWEBSUB]}" -o "$DEST_FILE_SUB_PAGE"
+curl -fsSL "${URL_CLASH_SUB[$CLASH]}" -o "$DEST_FILE_CLASH_SUB" || fail "Could not download the Clash subscription template."
+curl -fsSL "${URL_SUB_PAGE[$CUSTOMWEBSUB]}" -o "$DEST_FILE_SUB_PAGE" || fail "Could not download the subscription page."
 
 sed -i "s/\${DOMAIN}/$domain/g" "$DEST_FILE_SUB_PAGE"
 sed -i "s/\${DOMAIN}/$domain/g" "$DEST_FILE_CLASH_SUB"
@@ -1054,20 +1131,33 @@ sed -i "s|sub.legiz.ru|$domain/$sub2singbox_path|g" "$DEST_FILE_SUB_PAGE"
 #sed -i -e "s|https://t.me/gozargah_marzban|$tg_escaped_link|g" -e "s|https://github.com/Gozargah/Marzban#donation|$tg_escaped_link|g" "$DEST_FILE_SUB_PAGE"
 
 ######################cronjob for ssl/reload service/cloudflareips######################################
-crontab -l | grep -v "certbot\|x-ui\|cloudflareips" | crontab -
-(crontab -l 2>/dev/null; echo '@reboot /usr/bin/sub2sing-box server --bind 127.0.0.1 --port 8080 > /dev/null 2>&1') | crontab -
-(crontab -l 2>/dev/null; echo '@daily x-ui restart > /dev/null 2>&1 && nginx -s reload;') | crontab -
-(crontab -l 2>/dev/null; echo '@monthly certbot renew --nginx --non-interactive --post-hook "nginx -s reload" > /dev/null 2>&1;') | crontab -
+install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+cat > /etc/letsencrypt/renewal-hooks/deploy/x-ui-pro <<'CERTBOT_HOOK'
+#!/bin/sh
+systemctl reload nginx
+systemctl restart x-ui
+CERTBOT_HOOK
+chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/x-ui-pro
+existing_crontab=$(crontab -l 2>/dev/null || :)
+if ! grep -Fq '/usr/bin/sub2sing-box server' <<<"$existing_crontab"; then
+    { printf '%s\n' "$existing_crontab"; printf '%s\n' '@reboot /usr/bin/sub2sing-box server --bind 127.0.0.1 --port 8080 > /dev/null 2>&1'; } | crontab -
+fi
 ##################################ufw###################################################################
-ufw disable
 ufw allow 22/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
-ufw allow 443/udp
+if [[ $hy2_enabled == yes ]]; then
+    ufw allow "$hy2_port/udp" || fail "Could not update UFW for Hy2."
+else
+    ufw allow 443/udp
+fi
 ufw --force enable  
+if [[ $hy2_enabled == yes ]]; then
+    verify_subscriptions
+fi
 ##################################Show Details##########################################################
 
-if systemctl is-active --quiet x-ui; then clear
+if systemctl is-active --quiet x-ui; then
 	printf '0\n' | x-ui | grep --color=never -i ':'
 	msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
 	nginx -T | grep -i 'ssl_certificate\|ssl_certificate_key'
@@ -1087,7 +1177,12 @@ if systemctl is-active --quiet x-ui; then clear
  	echo -e "Username:  ${config_username} \n" 
 	echo -e "Password:  ${config_password} \n" 
 	msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
-    msg_inf "Web Sub Page your first client: https://${domain}/${web_path}?name=first\n"
+    if [[ $hy2_enabled == yes ]]; then
+        printf 'Web subscription page: %s\n' "https://${domain}/${web_path}?name=${hy2_sub_id}"
+        printf 'Hysteria 2: %s\n' "$hy2_link"
+    else
+        printf 'Web subscription page: %s\n' "https://${domain}/${web_path}?name=<subId>"
+    fi
     msg_inf "Your local sub2sing-box instance: https://${domain}/$sub2singbox_path/\n"
   msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
 	msg_inf "Please Save this Screen!!"	
