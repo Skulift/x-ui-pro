@@ -18,6 +18,8 @@ hy2_domain=
 hy2_cert=
 hy2_key=
 hy2_panel_url=
+backup_only=no
+argument_count=$#
 ##################################generate ports and paths#############################################################
 get_port() {
 	echo $(( ((RANDOM<<15)|RANDOM) % 49152 + 10000 ))
@@ -51,6 +53,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --add-hy2) hy2_mode=add; shift; continue;;
     --no-hy2) hy2_enabled=no; shift; continue;;
+    --enable-db-backups) backup_only=yes; shift; continue;;
     --help|-h)
       cat <<'USAGE'
 Fresh installation (Debian/Ubuntu, systemd):
@@ -60,6 +63,8 @@ Fresh installation (Debian/Ubuntu, systemd):
 Add Hy2 to an existing 3x-ui installation:
   sudo bash x-ui-latest.sh --add-hy2 --panel-url https://HOST/PANEL_PATH/
     --hy2-domain HOST [--hy2-port PORT] [--hy2-cert FULLCHAIN --hy2-key PRIVATE_KEY]
+Enable daily database backups on an existing installation:
+  sudo bash x-ui-latest.sh --enable-db-backups
 USAGE
       exit 0;;
   esac
@@ -90,6 +95,68 @@ done
 fail() {
     msg_err "$*" >&2
     exit 1
+}
+
+enable_db_backups() {
+    local backup_dir=/var/backups/x-ui-pro
+    local backup_script=/usr/local/sbin/x-ui-pro-db-backup
+    local unit_dir=/etc/systemd/system
+    [[ -s $XUIDB ]] || fail "Cannot find the 3x-ui SQLite database at $XUIDB."
+    command -v sqlite3 >/dev/null || fail "Install the sqlite3 package to enable database backups."
+    install -d -m 0700 -o root -g root "$backup_dir" || fail "Cannot create the backup directory."
+
+    cat > "$backup_script" <<'BACKUP_SCRIPT' || fail "Cannot write the database backup script."
+#!/bin/bash
+set -eu
+umask 077
+
+database=$1
+backup_dir=$2
+if [[ ! -s $database ]]; then
+    printf 'Database missing or empty: %s\n' "$database" >&2
+    exit 1
+fi
+
+cd "$backup_dir"
+filename="x-ui-$(date +%F).db"
+temp_file=$(mktemp .x-ui-backup.XXXXXXXX)
+trap 'rm -f -- "$temp_file" "${temp_file}-journal"' EXIT
+trap 'exit 1' HUP INT TERM
+sqlite3 -batch -bail -readonly -cmd '.timeout 5000' "$database" ".backup '$temp_file'"
+mv -fT -- "$temp_file" "$filename"
+
+find . -maxdepth 1 -type f -name 'x-ui-????-??-??.db' -mmin +10079 -delete
+printf 'Database backup saved to %s/%s\n' "$backup_dir" "$filename"
+BACKUP_SCRIPT
+    chmod 0750 "$backup_script" || fail "Cannot set permissions on the database backup script."
+
+    cat > "$unit_dir/x-ui-pro-db-backup.service" <<BACKUP_SERVICE || fail "Cannot write the database backup service."
+[Unit]
+Description=Back up the 3x-ui database
+
+[Service]
+Type=oneshot
+ExecStart=$backup_script $XUIDB $backup_dir
+TimeoutStartSec=5min
+BACKUP_SERVICE
+
+    cat > "$unit_dir/x-ui-pro-db-backup.timer" <<'BACKUP_TIMER' || fail "Cannot write the database backup timer."
+[Unit]
+Description=Daily 3x-ui database backup
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+BACKUP_TIMER
+
+    systemctl daemon-reload &&
+        systemctl start x-ui-pro-db-backup.service &&
+        systemctl enable --now x-ui-pro-db-backup.timer ||
+        fail "Could not enable database backups. Check journalctl -u x-ui-pro-db-backup.service."
+    printf 'Daily database backups enabled in %s (7-day retention).\n' "$backup_dir"
 }
 
 valid_domain() {
@@ -244,6 +311,11 @@ fi
     fail "Invalid UDP port. Use a value from 1 to 65535."
 exec 9>/run/lock/x-ui-pro-install.lock
 flock -n 9 || fail "Another x-ui-pro operation is running."
+if [[ $backup_only == yes ]]; then
+    [[ $argument_count -eq 1 ]] || fail "Use --enable-db-backups by itself."
+    enable_db_backups
+    exit 0
+fi
 hy2_resolve=()
 if [[ $hy2_mode == add ]]; then
     [[ $hy2_enabled == yes ]] || fail "--add-hy2 cannot be combined with --no-hy2."
@@ -1155,6 +1227,7 @@ ufw --force enable
 if [[ $hy2_enabled == yes ]]; then
     verify_subscriptions
 fi
+enable_db_backups
 ##################################Show Details##########################################################
 
 if systemctl is-active --quiet x-ui; then
